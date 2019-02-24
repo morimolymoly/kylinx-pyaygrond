@@ -1,0 +1,982 @@
+diff -ruN xen-4.2.1-origin/extras/mini-os/events.c xen-4.2.1-merge/extras/mini-os/events.c
+--- xen-4.2.1-origin/extras/mini-os/events.c	2012-12-17 23:00:04.000000000 +0800
++++ xen-4.2.1-merge/extras/mini-os/events.c	2016-12-04 20:51:12.000000000 +0800
+@@ -21,6 +21,7 @@
+ #include <mini-os/hypervisor.h>
+ #include <mini-os/events.h>
+ #include <mini-os/lib.h>
++#include <mini-os/xmalloc.h>
+ 
+ #define NR_EVS 1024
+ 
+diff -ruN xen-4.2.1-origin/extras/mini-os/include/lib.h xen-4.2.1-merge/extras/mini-os/include/lib.h
+--- xen-4.2.1-origin/extras/mini-os/include/lib.h	2012-12-17 23:00:04.000000000 +0800
++++ xen-4.2.1-merge/extras/mini-os/include/lib.h	2016-12-04 20:49:58.000000000 +0800
+@@ -198,7 +198,11 @@
+ int alloc_fd(enum fd_type type);
+ void close_all_files(void);
+ extern struct thread *main_thread;
++/*update library thread*/
++extern struct thread *update_thread;
++extern struct thread *lazy_thread;
+ void sparse(unsigned long data, size_t size);
++void lazy_binding_parse_sym(void);
+ #endif
+ 
+ #endif /* _LIB_H_ */
+diff -ruN xen-4.2.1-origin/extras/mini-os/lib/sys.c xen-4.2.1-merge/extras/mini-os/lib/sys.c
+--- xen-4.2.1-origin/extras/mini-os/lib/sys.c	2012-12-17 23:00:05.000000000 +0800
++++ xen-4.2.1-merge/extras/mini-os/lib/sys.c	2016-08-04 17:14:49.000000000 +0800
+@@ -81,7 +81,7 @@
+ 	return ret; \
+     }
+ 
+-#define NOFILE 32
++#define NOFILE 100
+ extern void minios_interface_close_fd(int fd);
+ extern void minios_evtchn_close_fd(int fd);
+ extern void minios_gnttab_close_fd(int fd);
+@@ -342,7 +342,7 @@
+ 
+ int close(int fd)
+ {
+-    printk("close(%d)\n", fd);
++    printk("close(%d)\n\n", fd);
+     switch (files[fd].type) {
+         default:
+ 	    files[fd].type = FTYPE_NONE;
+@@ -755,7 +755,7 @@
+ #endif
+     DEFINE_WAIT(console_w);
+ 
+-    assert(thread == main_thread);
++    //assert(thread == main_thread);
+ 
+     DEBUG("select(%d, ", nfds);
+     dump_set(nfds, readfds, writefds, exceptfds, timeout);
+diff -ruN xen-4.2.1-origin/extras/mini-os/main.c xen-4.2.1-merge/extras/mini-os/main.c
+--- xen-4.2.1-origin/extras/mini-os/main.c	2012-12-17 23:00:05.000000000 +0800
++++ xen-4.2.1-merge/extras/mini-os/main.c	2017-02-09 10:12:41.150846924 +0800
+@@ -1,4 +1,6 @@
+ /*
++ * We put lazy binding and library live update code here.
++ * If you want to restore, just restore the app_main function, other added functions won't disturb.
+  * POSIX-compatible main layer
+  *
+  * Samuel Thibault <Samuel.Thibault@eu.citrix.net>, October 2007
+@@ -15,12 +17,20 @@
+ #include <unistd.h>
+ #include <xenbus.h>
+ #include <events.h>
++#include <netinet/in.h>
++#include <sys/types.h>
++#include <sys/socket.h>
++#include <arpa/inet.h>
++#include <string.h>
++#include <sys/time.h>
++#include <traps.h>
+ 
+ extern int main(int argc, char *argv[], char *envp[]);
+ extern void __libc_init_array(void);
+ extern void __libc_fini_array(void);
+ extern unsigned long __CTOR_LIST__[];
+ extern unsigned long __DTOR_LIST__[];
++extern struct thread *update_thread;
+ 
+ #if 0
+ #include <stdio.h>
+@@ -162,6 +172,7 @@
+     exit(main(argc, argv, envp));
+ }
+ 
++
+ void _exit(int ret)
+ {
+     int i;
+@@ -182,11 +193,300 @@
+     }
+     do_exit();
+ }
++int htoi(char s[])
++{
++    int n = 0;
++    int i = 0;
++    while (s[i] != '\0' && s[i] != '\n') {
++        if (s[i] == '0') {
++            if (s[i+1] == 'x' || s[i+1] == 'X')
++                            i+=2;
++        }
++        if (s[i] >= '0' && s[i] <= '9') {
++            n = n * 16 + (s[i] - '0');
++        } else if (s[i] >= 'a' && s[i] <= 'f') {
++            n = n * 16 + (s[i] - 'a') + 10;
++        } else if (s[i] >= 'A' && s[i] <= 'F') {
++            n = n * 16 + (s[i] - 'A') + 10;
++        } else
++            return -1;
++        ++i;
++    }
++    return n;
++}
++unsigned long *gots;	//so_test.so's got address
++unsigned long *gotm = (unsigned long *)(0x888c0);	//mini-os(with libm-newlib as shared lib)'s got address
++struct timeval start, end;
++
++void update_minios_parse_sym(void)
++{
++	/*write moduleID to dom0*/
++	int domid;
++	char path[128];
++	char value[10];
++	char *msg, *realaddr;
++	int i;
++	gettimeofday(&start, NULL);
++	domid = xenbus_read_integer("domid");
++	snprintf(path, sizeof(path), "/local/domain/%d/console/mid", domid);
++	sprintf(value, "%p", gotm[1]);
++	xenbus_write(0, path, value);
++	gettimeofday(&end, NULL);
++
++	printk("--------parse1 dym: %ldus\n", 1000000 * ( end.tv_sec - start.tv_sec ) + end.tv_usec -start.tv_usec);
++	//gotm[3] = (unsigned long)0xdf1a0;	
++	//getchar();
++	gettimeofday(&start, NULL);
++	for (i=0; i<3; i++){
++		snprintf(path, sizeof(path), "/local/domain/%d/console/realaddr%d", domid, i);
++		msg = xenbus_read(XBT_NIL, path, &realaddr);
++		if (msg)
++			printk("Could not read realaddr!\n");
++		gotm[3+i] = (unsigned long)(0xfd000+htoi(realaddr));
++	}
++}
++
++void update_sotest_parse_sym(void)
++{
++	int domid, count1, i;	
++	char path[128];
++	char *msg, *val_count, *realaddr;
++
++	printf("-------inside the sotest\n");
++	domid = xenbus_read_integer("domid");
++	snprintf(path, sizeof(path), "/local/domain/%d/console/count1", domid);
++	msg = xenbus_read(XBT_NIL, path, &val_count);
++	count1 = atoi(val_count);
++
++	for (i=0; i<count1; i++){
++		snprintf(path, sizeof(path), "/local/domain/%d/console/addr1_%d", domid, i);
++		msg = xenbus_read(XBT_NIL, path, &realaddr);
++		if (msg)
++			printk("Could not read realaddr!\n");
++		gots[3+i] = (unsigned long )htoi(realaddr);
++	}
++	//printf("-------realaddr = %s\n", realaddr);
++	gettimeofday(&end, NULL);
++	printk("--------rel2 dym: %ldus\n", 1000000 * ( end.tv_sec - start.tv_sec ) + end.tv_usec -start.tv_usec);
++}
++
++/*get updated shared library*/
++static void get_shared_library(void *p)
++{
++	/*
++	int domid;
++	char pathdomgfn[128];
++	unsigned long dom_gfn;
++	char gfn[64];
++	char *shared_addr;
++*/
++	/*step 1: get a pfn of page*/
++/*	shared_addr = (char *)alloc_page();
++	dom_gfn = virt_to_pfn(shared_addr);
++	snprintf(gfn, sizeof(gfn), "%d", dom_gfn);
++*/
++	/*step 2: write pfn to xenstore*/
++	/*
++	domid = xenbus_read_integer("domid");
++	snprintf(pathdomgfn, sizeof(pathdomgfn), "/local/domain/%d/console/domgfn", domid);
++	xenbus_write(0, pathdomgfn, gfn);
++	memcpy(shared_addr, "Hello World", sizeof("Hello World"));
++	printf("shared_addr = %s\n", shared_addr);
++	*/
++
++	/*
++	int server_sockfd;
++	int client_sockfd;
++	int len;
++	struct sockaddr_in my_addr; //server
++	struct sockaddr_in remote_addr; //client
++	int sin_size = sizeof(struct sockaddr_in);
++
++	//declare a struct of socket
++	memset(&my_addr, 0, sizeof(my_addr));//init sockaddr_in
++	my_addr.sin_family = AF_INET; //Set IP communication
++	my_addr.sin_addr.s_addr = INADDR_ANY;//server IP, permit any IP to connect
++	my_addr.sin_port = htons(10000);//set a server port
++
++	//build a socke, if success, return a fd of socket
++	if ((server_sockfd = socket(PF_INET, SOCK_STREAM, 0)) < 0){
++		perror("socket");
++		return 1;
++	}
++
++	//bind socket to network IP
++	if (bind(server_sockfd, (struct sockaddr *)&my_addr, sizeof(struct sockaddr)) < 0){
++		perror("bind");
++		return 1;
++	}
++
++	// listen a request
++	listen(server_sockfd, 5);
++	
++	//wait for a request
++	if ((client_sockfd = accept(server_sockfd, (struct sockaddr *)&remote_addr, &sin_size)) < 0){
++		perror("accept");
++		return 1;
++	}
++	char *buf = (char *)malloc(sizeof(char) *512);
++	char **dest = (char **)malloc(sizeof(char *)*2);
++	int i;
++	for (i=0; i<2; i++)
++		dest[i] = (char *)malloc(sizeof(char)*512);
++	i=0;
++	while ((len = recv(client_sockfd, buf, 512, 0)) > 0){
++		memcpy(dest[i], buf, 512);
++		i++;
++	}
++	for (i=0; i<512; i++)
++		printf("%p, ", dest[0][i]);
++	printf("\n\n\n");
++	close(client_sockfd);
++	close(server_sockfd);
++	return 0;
++	*/
++	/*get .got.plt of libso_test2.so*/
++	int domid;
++	char path[128];
++	char *msg, *val, *realaddr;
++	unsigned long *got = (unsigned long *)(0x888c0);
++
++	domid = xenbus_read_integer("domid");
++	snprintf(path, sizeof(path), "/local/domain/%d/console/got", domid);
++	while (1){
++		msg = xenbus_read(XBT_NIL, path, &val);	
++		if (msg)
++			continue;
++		else
++		  break;
++	}
++	gettimeofday(&start, NULL);
++	printf("-----so_got_addr = 0x%x\n", htoi(val));
++		
++    gots = (unsigned long *)(htoi(val)+0x313000);
++	//printk("------------gots[0] = %p\n", gots[0]);
++	/*set moduleID in gots[1]*/
++	gots[1] = (unsigned long)0x1;		
++	/*set got[3] to update_parse_sym*/
++	//gotm[3] = update_minios_parse_sym;
++	gots[3] = update_sotest_parse_sym;
++
++    //symbol so_test's real address
++	snprintf(path, sizeof(path), "/local/domain/%d/console/raddr", domid);
++    printf("---->path: %s\n", path);
++	msg = xenbus_read(XBT_NIL, path, &realaddr);
++	if (msg)
++		printk("Could not read realaddr!\n");
++	//printf("-----so_test addr = 0x%x\n", htoi(realaddr));
++	got[3] = (unsigned long)(htoi("0x270") + 0x313000);
++
++	gettimeofday(&end, NULL);
++	printk("------resolve2 time : %ldus\n", 1000000*(end.tv_sec - start.tv_sec) + end.tv_usec - start.tv_usec);
++
++}
++
++
++/*parse symbol, like _dl_runtime_resolve*/
++void lazy_binding_parse_sym()
++{
++	int domid, count0, count1, i, j;
++	char path[128];
++	//char value[12];
++	//unsigned long *got = (unsigned long *)(&_edata+0xa0);
++	char *msg, *val_count, *realaddr;
++	unsigned long *got0, *got1;
++	printf("inside the parse_sym\n");	
++	/*step 1:write addr into xenstore!*/
++	domid = xenbus_read_integer("domid");
++	snprintf(path, sizeof(path), "/local/domain/%d/console/flag", domid);
++	//sprintf(value, "%p", got[1]);
++	xenbus_write(0, path, "1");
++	//printk("value = %s\n", value);
++	/*step 2:read xenstore and set .got.plt table*/
++	//label 1: read count
++	snprintf(path, sizeof(path), "/local/domain/%d/console/count0", domid);
++	while (1) {
++		msg = xenbus_read(XBT_NIL, path, &val_count);
++		if (msg)
++			continue;
++		break;
++	}
++	count0 = atoi(val_count);
++	printf("-----count0 = %d\n", count0);
++	//printf("val_count = %s\n", val_count);
++	//label 2: read addr
++	//find .plt.got
++	//printf("----------------count = %d\n", count);
++	snprintf(path, sizeof(path), "/local/domain/%d/console/count1", domid);
++	msg = xenbus_read(XBT_NIL, path, &val_count);
++	count1 = atoi(val_count);
++	printf("-----count1 = %d\n", count1);
++	
++	for (j=0; j<2; j++){
++		snprintf(path, sizeof(path), "/local/domain/%d/console/r_got%d", domid, j);
++		if (j == 0){
++			msg = xenbus_read(XBT_NIL, path, &realaddr);
++			if (msg)
++				printk("Could not read realaddr1!\n");
++			got0 = (unsigned long *)htoi(realaddr);
++			printf("-------------got0 = %p\n", got0);
++		}
++		if (j == 1){
++			msg = xenbus_read(XBT_NIL, path, &realaddr);
++			if (msg)
++				printk("Could not read realaddr2!\n");
++			got1 = (unsigned long *)(htoi(realaddr)+0x112000);
++			printf("-------------got1 = %p\n", got1);
++		}
++	}
++	
++	for (i=0; i<count0; i++){
++		snprintf(path, sizeof(path), "/local/domain/%d/console/addr0_%d", domid, i);
++		msg = xenbus_read(XBT_NIL, path, &realaddr);
++		if (msg)
++			printk("Could not read realaddr3!\n");
++		printf("realaddr0_%d = %p\n", i, htoi(realaddr));
++		got0[i+3] = (unsigned long)htoi(realaddr);
++	}
++	for (i=0; i<count1; i++){
++		snprintf(path, sizeof(path), "/local/domain/%d/console/addr1_%d", domid, i);
++		msg = xenbus_read(XBT_NIL, path, &realaddr);
++		if (msg)
++			printk("Could not read realaddr4!\n");
++		printf("realaddr1_%d = %p\n", i, htoi(realaddr));
++		got1[i+3] = (unsigned long)htoi(realaddr);
++	}
++	//__asm __volatile ("call %0" :: "m" (got0[3]));
++}
++
++/*define plt_func*/
++/*
++void plt_func(void)
++{
++	__asm __volatile ("call lazy_binding_parse_sym");
++}
++*/
++
++/*init .plt.got, make it to point plt_func*/
++/*
++void init_plt_got(unsigned long *got)
++{
++	got[3] = (unsigned long)plt_func;
++}
++*/
++
+ 
+ int app_main(start_info_t *si)
+ {
++	/*Uncomment these code to test shared library dynamic mapping & online update */
++
++	//unsigned long *got = (unsigned long *)(0x888c0);
++	//got[3] = lazy_binding_parse_sym;
++
+     printk("Dummy main: start_info=%p\n", si);
+     main_thread = create_thread("main", call_main, si);
++	//update_thread = create_thread("update", get_shared_library, NULL);
++
+     return 0;
+ }
+ #endif
+diff -ruN xen-4.2.1-origin/extras/mini-os/main_iac_gnttable_evtchn.c xen-4.2.1-merge/extras/mini-os/main_iac_gnttable_evtchn.c
+--- xen-4.2.1-origin/extras/mini-os/main_iac_gnttable_evtchn.c	1970-01-01 08:00:00.000000000 +0800
++++ xen-4.2.1-merge/extras/mini-os/main_iac_gnttable_evtchn.c	2017-02-08 22:46:44.258847059 +0800
+@@ -0,0 +1,462 @@
++/*
++ * Replace main.c with this file to test IAC
++ * IAC(inter appliance communication) test code, using grant table to send message and event channel to notify remote.
++ *We put the IAC code here because event channel didn't work well in  stubdom/c/main.c file, where we used to put our test code 
++ * POSIX-compatible main layer
++ *
++ * Samuel Thibault <Samuel.Thibault@eu.citrix.net>, October 2007
++ */
++
++#ifdef HAVE_LIBC
++#include <os.h>
++#include <sched.h>
++#include <console.h>
++#include <netfront.h>
++#include <pcifront.h>
++#include <time.h>
++#include <stdlib.h>
++#include <unistd.h>
++#include <xenstore.h>
++#include <xenbus.h>
++#include <events.h>
++#include <lib.h>
++#include <xmalloc.h>
++#include <gntmap.h>
++#include <gnttab.h>
++#include <events.h>
++#include <hypervisor.h>
++#include <sys/time.h>
++
++ extern int main(int argc, char *argv[], char *envp[]);
++ extern void __libc_init_array(void);
++ extern void __libc_fini_array(void);
++ extern unsigned long __CTOR_LIST__[];
++ extern unsigned long __DTOR_LIST__[];
++ extern int page_count;
++ struct timeval start, end;
++
++#if 0
++#include <stdio.h>
++int main(int argc, char *argv[], char *envp[])
++{
++    printf("Hello, World!\n");
++    return 1;
++}
++#endif
++
++void _init(void)
++{
++}
++
++void _fini(void)
++{
++}
++
++extern char __app_bss_start, __app_bss_end;
++
++//get domid
++unsigned int get_domid(struct xs_handle * xs)
++{
++    //unsigned int domid;
++    char *buf;
++    unsigned int len, domid;
++    buf = xs_read(xs, XBT_NULL, "domid", &len);
++    domid = atoi(buf);
++    printf( "---> domid : %d\n" , domid);
++    return domid;
++}
++
++//the event handler
++void parent_evt_handler(evtchn_port_t port, struct pt_regs *regs, void *data)
++{
++    int flags;
++    struct timeval start1, end1;
++	int timeuse;
++    unsigned long offset = 2792;
++    unsigned long offset_end = 2803;
++	void *received_page = data;
++	char buf[4096];
++	int rc;
++    printk("[Port %d]-event received\n", port);
++    local_irq_save(flags);
++	
++    gettimeofday( &start1, NULL);
++   
++	memcpy(buf, received_page, sizeof(char) * 4096);
++    printf( "----> %p\n" , virt_to_mfn(received_page));
++
++    printf("rcv_data: ");
++    for (int i = offset; i < offset_end; i++)
++        printf("%c", buf[i]);
++    printf("\n");
++
++    //gntmap_fini(map);
++
++    gettimeofday( &end1, NULL);
++
++    timeuse = 1000000 * (end1.tv_sec - start1.tv_sec) + (end1.tv_usec - start1.tv_usec);
++    printf("Time : %d us\n", timeuse);
++
++    //read message done, send the event
++    rc = notify_remote_via_evtchn(port);
++    printf("notify_remote rc: %d\n\n", rc);
++
++    local_irq_restore(flags);
++    
++}
++
++//child event handler
++void child_evt_handler(evtchn_port_t port, struct pt_regs *regs, void *data)
++{
++    int flags;
++    struct timeval end;
++    int timeuse;
++
++    local_irq_save(flags);
++    printk("[Port %d]-event received\n", port);
++    gettimeofday( &end, NULL);
++    //printf("end time: %d\n\n", 1000000 * end.tv_sec + end.tv_usec);
++    timeuse = 1000000 * (end.tv_sec - start.tv_sec) + (end.tv_usec - start.tv_usec);
++    printf("Time : %d us\n\n", timeuse);
++
++//    gnttab_end_access(1789);
++
++    local_irq_restore(flags);
++    
++}
++
++int do_main(void)
++{
++        // for pipe
++    char kylinx_fd[10] = "PIPE";
++//  char status[10];
++
++// for message queue
++//  char msg_type[20];
++    char msg_mtext[20] = "MESSAGE";
++
++// for kill signal
++//  char kill_domid[10];
++    char kill_sig[20] = "KILL_SIGNAL";
++
++// for exit & wait signal
++    char exit_sig[20] = "EXIT_SIGNAL";
++
++    struct xs_handle *xs;
++    unsigned int domid, remote_dom;
++    evtchn_port_t local_port, remote_port;
++    //struct timeval start;
++    //struct timeval start2, end2;
++	//int timeuse;
++
++    int is_parent;
++    int rc, rc2;
++    
++	struct gntmap *map;
++    char shared_page[1024];
++    unsigned long offset;
++    unsigned long offset_end;
++    grant_ref_t grant;
++
++    void *received_page;
++    uint32_t refs;
++
++    /* Get a connection to the daemon */
++    xs = xs_daemon_open();
++    if(xs == NULL)
++    {
++        perror( "---> xs_deamon_open:" );
++    }
++    printf( "---> xs_deamon_open OK!\n" );
++
++    domid = get_domid(xs);
++    is_parent = domid % 2 == 0 ? 0 : 1;
++    
++    
++    if(is_parent == 1)
++        goto parent;
++    else
++        goto child;
++
++parent:
++    printf( "---> I am parent DomU!\n" );
++    
++    //wait the next dom to start
++    sleep(10);
++
++    remote_dom = domid + 1;
++
++    //map the grant page
++    map = (struct gntmap *)malloc(sizeof(struct gntmap));
++    refs =  1789;
++    
++    gntmap_init(map);
++    
++    received_page = gntmap_map_grant_refs(map, 1, &remote_dom, 0, &refs, 0);
++    printf("receive_page:  %p\n", received_page);
++   // printf("receive_page:  %p\n", virt_to_mfn(received_page));
++
++    //alloc a unbounded event channel
++    rc = evtchn_alloc_unbound(remote_dom, parent_evt_handler, received_page, &local_port);
++    printf("alloc_unbound rc: %d\n", rc);
++    printf("local port: %d\n\n", local_port);
++
++    unmask_evtchn(local_port);
++    printf("unmask the evtchn\n");
++    
++    return 0;
++
++
++child:
++    printf( "---> I am child DomU!\n" );
++    remote_dom = domid - 1;
++
++    //grant page
++    printf( "machine address : %p\n" , virt_to_mfn(shared_page));
++    printf( "virtual address : %p\n" , (shared_page));
++    offset = (( unsigned long)shared_page & 0x0000000000000fff);
++    printf( "%lu\n" , offset);
++    // grant page to last domain
++    grant = gnttab_grant_access(remote_dom, virt_to_mfn(shared_page), 0);
++
++    printf("offset = %d\n", offset);
++    printf("refs = %d\n", grant);
++
++    sleep(10);
++
++    //get the remote port from xenstore
++    //remote_port = read_xenstore(remote_dom, "evtchn_port");
++    remote_port = 5;
++
++    //bind the interdomain
++    rc2 = evtchn_bind_interdomain(remote_dom, remote_port, child_evt_handler, NULL, &local_port);
++    printf("bind_interdomain rc: %d\n", rc2);
++    printf("local port: %d\n\n", local_port);
++    
++    unmask_evtchn(local_port);
++    printf("unmask the evtchn\n\n");
++
++    
++    sleep(2);
++
++    //pipe
++    printf("------>pipe\n");
++    gettimeofday( &start, NULL);
++    //printf("start time: %d\n", 1000000 * start.tv_sec + start.tv_usec);
++    strcpy(shared_page, kylinx_fd);
++    offset_end = offset + strlen(kylinx_fd);
++    printf("offset_end = %d\n", offset_end);
++    rc = notify_remote_via_evtchn(local_port); //send nofication to tell remote to read message
++    printf("notify_remote rc: %d\n", rc);
++
++    sleep(2);
++
++    //message queue
++    printf("------>message queue\n");
++    gettimeofday( &start, NULL);
++    //printf("start time: %d\n", 1000000 * start.tv_sec + start.tv_usec);
++    strcpy(shared_page, msg_mtext);
++    offset_end = offset + strlen(msg_mtext);
++    printf("offset_end = %d\n", offset_end);
++    rc = notify_remote_via_evtchn(local_port);
++    printf("notify_remote rc: %d\n", rc);
++
++    sleep(2);
++
++    //kill signal
++    printf("------>kill signal\n");
++    gettimeofday( &start, NULL);
++    //printf("start time: %d\n", 1000000 * start.tv_sec + start.tv_usec);
++    strcpy(shared_page, kill_sig);
++    offset_end = offset + strlen(kill_sig);
++    printf("offset_end = %d\n", offset_end);
++    rc = notify_remote_via_evtchn(local_port);
++    printf("notify_remote rc: %d\n", rc);
++
++    sleep(2);
++
++    //exit & wait signal
++    printf("------>exit & wait signal\n");
++    gettimeofday( &start, NULL);
++    //printf("start time: %d\n", 1000000 * start.tv_sec + start.tv_usec);
++    strcpy(shared_page, exit_sig);
++    offset_end = offset + strlen(exit_sig);
++    printf("offset_end = %d\n", offset_end);
++    rc = notify_remote_via_evtchn(local_port);
++    printf("notify_remote rc: %d\n", rc);
++
++    sleep(2);
++
++    //share memory
++    printf("------>share memory\n");
++    gettimeofday( &start, NULL);
++    //printf("start time: %d\n", 1000000 * start.tv_sec + start.tv_usec);
++    strcpy(shared_page, "shared_page");
++    offset_end = offset + strlen("shared_page");
++    printf("offset_end = %d\n", offset_end);
++    rc = notify_remote_via_evtchn(local_port);
++    printf("notify_remote rc: %d\n", rc);
++
++    //gnttab_end_access(grant); 
++
++    return 0;
++}
++
++
++static void call_main(void *p)
++{
++    char *c, quote;
++#ifdef CONFIG_QEMU_XS_ARGS
++    char *domargs, *msg;
++#endif
++    int argc;
++    char **argv;
++    char *envp[] = { NULL };
++#ifdef CONFIG_QEMU_XS_ARGS
++    char *vm;
++    char path[128];
++    int domid;
++#endif
++    int i;
++
++    /* Let other parts initialize (including console output) before maybe
++     * crashing. */
++    //sleep(1);
++
++#ifdef CONFIG_SPARSE_BSS
++    sparse((unsigned long) &__app_bss_start, &__app_bss_end - &__app_bss_start);
++#endif
++#if defined(HAVE_LWIP) && defined(CONFIG_START_NETWORK) && defined(CONFIG_NETFRONT)
++    start_networking();
++#endif
++#ifdef CONFIG_PCIFRONT
++    create_thread("pcifront", pcifront_watches, NULL);
++#endif
++
++    //test the IAC_eventchannel
++    do_main();  
++
++#ifdef CONFIG_QEMU_XS_ARGS
++    /* Fetch argc, argv from XenStore */
++    printf("-----into the CONFIG_QEMU_XS_ARGS");
++
++    domid = xenbus_read_integer("target");
++    if (domid == -1) {
++        printk("Couldn't read target\n");
++        do_exit();
++    }
++
++    snprintf(path, sizeof(path), "/local/domain/%d/vm", domid);
++    msg = xenbus_read(XBT_NIL, path, &vm);
++    if (msg) {
++        printk("Couldn't read vm path\n");
++        do_exit();
++    }
++    printk("dom vm is at %s\n", vm);
++
++    snprintf(path, sizeof(path), "%s/image/dmargs", vm);
++    free(vm);
++    msg = xenbus_read(XBT_NIL, path, &domargs);
++
++    if (msg) {
++        printk("Couldn't get stubdom args: %s\n", msg);
++        domargs = strdup("");
++    }
++#endif
++
++    argc = 1;
++
++#define PARSE_ARGS(ARGS,START,QUOTE,END) \
++    c = ARGS; \
++    quote = 0; \
++    while (*c) { \
++     if (*c != ' ') { \
++         START; \
++         while (*c) { \
++          if (quote) { \
++              if (*c == quote) { \
++               quote = 0; \
++               QUOTE; \
++               continue; \
++           } \
++       } else if (*c == ' ') \
++       break; \
++       if (*c == '"' || *c == '\'') { \
++          quote = *c; \
++          QUOTE; \
++          continue; \
++      } \
++      c++; \
++  } \
++} else { \
++    END; \
++    while (*c == ' ') \
++      c++; \
++} \
++} \
++if (quote) {\
++    printk("Warning: unterminated quotation %c\n", quote); \
++    quote = 0; \
++}
++#define PARSE_ARGS_COUNT(ARGS) PARSE_ARGS(ARGS, argc++, c++, )
++#define PARSE_ARGS_STORE(ARGS) PARSE_ARGS(ARGS, argv[argc++] = c, memmove(c, c + 1, strlen(c + 1) + 1), *c++ = 0)
++
++PARSE_ARGS_COUNT((char*)start_info.cmd_line);
++#ifdef CONFIG_QEMU_XS_ARGS
++PARSE_ARGS_COUNT(domargs);
++#endif
++
++argv = alloca((argc + 1) * sizeof(char *));
++argv[0] = "main";
++argc = 1;
++
++PARSE_ARGS_STORE((char*)start_info.cmd_line)
++#ifdef CONFIG_QEMU_XS_ARGS
++PARSE_ARGS_STORE(domargs)
++#endif
++
++argv[argc] = NULL;
++
++for (i = 0; i < argc; i++)
++    printf("\"%s\" ", argv[i]);
++printf("\n");
++
++__libc_init_array();
++environ = envp;
++for (i = 0; __CTOR_LIST__[i] != 0; i++)
++    ((void((*)(void)))__CTOR_LIST__[i]) ();
++tzset();
++
++printf("will enter into the main\n");
++exit(main(argc, argv, envp));
++}
++
++void _exit(int ret)
++{
++    int i;
++
++    for (i = 0; __DTOR_LIST__[i] != 0; i++)
++        ((void((*)(void)))__DTOR_LIST__[i]) ();
++    close_all_files();
++    __libc_fini_array();
++    printk("main returned %d\n", ret);
++#if defined(HAVE_LWIP) && defined(CONFIG_NETFRONT)
++    stop_networking();
++#endif
++    stop_kernel();
++    if (!ret) {
++    /* No problem, just shutdown.  */
++        struct sched_shutdown sched_shutdown = { .reason = SHUTDOWN_poweroff };
++        HYPERVISOR_sched_op(SCHEDOP_shutdown, &sched_shutdown);
++    }
++    do_exit();
++}
++
++int app_main(start_info_t *si)
++{
++    printk("Dummy main: start_info=%p\n", si);
++    main_thread = create_thread("main", call_main, si);
++    //printf("---------------------page_count = %d\n", page_count);
++    return 0;
++}
++#endif
+diff -ruN xen-4.2.1-origin/extras/mini-os/Makefile xen-4.2.1-merge/extras/mini-os/Makefile
+--- xen-4.2.1-origin/extras/mini-os/Makefile	2012-12-17 23:00:04.000000000 +0800
++++ xen-4.2.1-merge/extras/mini-os/Makefile	2016-12-04 20:54:36.000000000 +0800
+@@ -147,7 +147,7 @@
+ APP_LDLIBS += -L$(XEN_ROOT)/stubdom/libxc-$(XEN_TARGET_ARCH) -whole-archive -lxenguest -lxenctrl -no-whole-archive
+ APP_LDLIBS += -lpci
+ APP_LDLIBS += -lz
+-APP_LDLIBS += -lm
++#APP_LDLIBS += -lm
+ LDLIBS += -lc
+ endif
+ 
+@@ -163,27 +163,46 @@
+ endif
+ 
+ $(OBJ_DIR)/$(TARGET): links include/list.h $(OBJS) $(APP_O) arch_lib
+-	$(LD) -r $(LDFLAGS) $(HEAD_OBJ) $(APP_O) $(OBJS) $(LDARCHLIB) $(LDLIBS) -o $@.o
+-	$(OBJCOPY) -w -G $(GLOBAL_PREFIX)* -G _start $@.o $@.o
+-	$(LD) $(LDFLAGS) $(LDFLAGS_FINAL) $@.o $(EXTRA_OBJS) -o $@
++	$(LD) $(LDFLAGS) $(LDFLAGS_FINAL) $(HEAD_OBJ) $(APP_O) $(OBJS) $(LDARCHLIB) $(EXTRA_OBJS) $(LDLIBS) -o $@
++	$(OBJCOPY) -w -G $(GLOBAL_PREFIX)* -G _start $@ $@
++	$(OBJDUMP) -S $@ > $@.asm
+ 	gzip -f -9 -c $@ >$@.gz
+ 
++# for build mini-os in a specific folder (so that not bother dropbox)
++OBJ_MINIOS=obj-minios
++$(OBJ_MINIOS): 
++	[ -d $@ ] || \
++	for i in $$(cd $(CURDIR) ; find . -type d) ; do \
++                mkdir -p $@/$$i ; \
++	done
++
++# we can use #make obj# to gen all objs in obj-mininos dir 
++.PHONY: obj obj-clean
++obj: $(OBJ_MINIOS)
++	$(MAKE) DESTDIR= OBJ_DIR=$(CURDIR)/$<
++	ln -sf ../domain_config $(CURDIR)/$<
++	ln -sf ../../../tools/libxl/xl $(CURDIR)/$</xl-test
++	
++obj-clean:
++	rm -fr $(OBJ_MINIOS)
++
+ .PHONY: clean arch_clean
+ 
+ arch_clean:
+ 	$(MAKE) --directory=$(TARGET_ARCH_DIR) OBJ_DIR=$(OBJ_DIR)/$(TARGET_ARCH_DIR) clean || exit 1;
+ 
+-clean:	arch_clean
++clean:arch_clean obj-clean
+ 	for dir in $(addprefix $(OBJ_DIR)/,$(SUBDIRS)); do \
+-		rm -f $$dir/*.o; \
++		rm -f $$dir/*.o $$dir/*.o.*; \
+ 	done
+ 	rm -f include/list.h
++	rm -fr include/x86/mini-os
++	rm -f $(OBJ_DIR)/*.o.* $(OBJ_DIR)/*.asm
+ 	rm -f $(OBJ_DIR)/*.o *~ $(OBJ_DIR)/core $(OBJ_DIR)/$(TARGET).elf $(OBJ_DIR)/$(TARGET).raw $(OBJ_DIR)/$(TARGET) $(OBJ_DIR)/$(TARGET).gz
+ 	find . $(OBJ_DIR) -type l | xargs rm -f
+ 	$(RM) $(OBJ_DIR)/lwip.a $(LWO)
+ 	rm -f tags TAGS
+ 
+-
+ define all_sources
+      ( find . -follow -name SCCS -prune -o -name '*.[chS]' -print )
+ endef
+diff -ruN xen-4.2.1-origin/extras/mini-os/minios.mk xen-4.2.1-merge/extras/mini-os/minios.mk
+--- xen-4.2.1-origin/extras/mini-os/minios.mk	2012-12-17 23:00:05.000000000 +0800
++++ xen-4.2.1-merge/extras/mini-os/minios.mk	2016-12-05 08:50:38.000000000 +0800
+@@ -6,7 +6,7 @@
+ 
+ # Define some default flags.
+ # NB. '-Wcast-qual' is nasty, so I omitted it.
+-DEF_CFLAGS += -fno-builtin -Wall -Werror -Wredundant-decls -Wno-format -Wno-redundant-decls
++DEF_CFLAGS += -fno-builtin -Wall -Wredundant-decls -Wno-format -Wno-redundant-decls
+ DEF_CFLAGS += $(call cc-option,$(CC),-fno-stack-protector,)
+ DEF_CFLAGS += $(call cc-option,$(CC),-fgnu89-inline)
+ DEF_CFLAGS += -Wstrict-prototypes -Wnested-externs -Wpointer-arith -Winline
+@@ -67,6 +67,7 @@
+ 
+ $(OBJ_DIR)/%.o: %.c $(HDRS) Makefile $(EXTRA_DEPS)
+ 	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
++	$(CC) $(CFLAGS) $(CPPFLAGS) -E $< -o $@.zym  # c pre processing
+ 
+ $(OBJ_DIR)/%.o: %.S $(HDRS) Makefile $(EXTRA_DEPS)
+ 	$(CC) $(ASFLAGS) $(CPPFLAGS) -c $< -o $@
+diff -ruN xen-4.2.1-origin/extras/mini-os/netfront.c xen-4.2.1-merge/extras/mini-os/netfront.c
+--- xen-4.2.1-origin/extras/mini-os/netfront.c	2012-12-17 23:00:05.000000000 +0800
++++ xen-4.2.1-merge/extras/mini-os/netfront.c	2016-05-09 10:48:02.000000000 +0800
+@@ -136,7 +136,7 @@
+ #ifdef HAVE_LIBC
+ 	    if (dev->netif_rx == NETIF_SELECT_RX) {
+ 		int len = rx->status;
+-		ASSERT(current == main_thread);
++		//ASSERT(current == main_thread);
+ 		if (len > dev->len)
+ 		    len = dev->len;
+ 		memcpy(dev->data, page+rx->offset, len);
+@@ -648,7 +648,7 @@
+ {
+     unsigned long flags;
+     int fd = dev->fd;
+-    ASSERT(current == main_thread);
++    //ASSERT(current == main_thread);
+ 
+     dev->rlen = 0;
+     dev->data = data;
+diff -ruN xen-4.2.1-origin/extras/mini-os/sched.c xen-4.2.1-merge/extras/mini-os/sched.c
+--- xen-4.2.1-origin/extras/mini-os/sched.c	2012-12-17 23:00:05.000000000 +0800
++++ xen-4.2.1-merge/extras/mini-os/sched.c	2016-12-05 08:59:40.000000000 +0800
+@@ -61,7 +61,10 @@
+ static struct thread_list thread_list = MINIOS_TAILQ_HEAD_INITIALIZER(thread_list);
+ static int threads_started;
+ 
++struct thread *update_thread;
+ struct thread *main_thread;
++//update shared_library thread
++struct thread *lazy_thread;
+ 
+ void inline print_runqueue(void)
+ {

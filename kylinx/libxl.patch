@@ -1,0 +1,1560 @@
+diff -ruN xen-4.2.1-origin/tools/libxl/libxl_dom.c xen-4.2.1-merge/tools/libxl/libxl_dom.c
+--- xen-4.2.1-origin/tools/libxl/libxl_dom.c	2012-12-17 23:01:09.000000000 +0800
++++ xen-4.2.1-merge/tools/libxl/libxl_dom.c	2016-12-04 21:32:25.000000000 +0800
+@@ -21,9 +21,18 @@
+ 
+ #include <xc_dom.h>
+ #include <xen/hvm/hvm_info_table.h>
++#include <signal.h>
++#include <xenstore.h>
++#include <pthread.h>
++
++extern Elf64_Addr sym_value[128][128];
++extern int count[2];
++extern int got_num;
++extern Elf64_Addr r_got[10];
+ 
+ libxl_domain_type libxl__domain_type(libxl__gc *gc, uint32_t domid)
+ {
++    signal(SIGTTOU, SIG_IGN);
+     libxl_ctx *ctx = libxl__gc_owner(gc);
+     xc_domaininfo_t info;
+     int ret;
+@@ -361,6 +370,98 @@
+     return 0;
+ }
+ 
++void watch_map(int domid)
++{
++	//step 1: listen /local/domain/domid/console/map
++	struct xs_handle *xs;
++	//xs_transaction_t xth;
++	char path[128];
++	char *value;
++	unsigned int len;
++	char str[10];
++	int error;
++	int i, j;
++
++	xs = xs_daemon_open();
++	if (xs == NULL){
++		printf("Could not connect to xenstore!\n");
++		exit(1);
++	}
++	/*
++	xth = xs_transaction_start(xs);
++	if (xth == 0) {
++		printf("Could not start xaction xenstore!\n");
++		exit(1);
++	}
++	*/
++
++	//domid = dom->guest_domid;
++	
++	snprintf(path, sizeof(path), "/local/domain/%d/console/flag", domid);
++	//printf("---------path = %s\n", path);
++	while (1) {
++	//	sleep(1);
++		value = xs_read(xs, XBT_NULL, path, &len);
++	//	printf("-------value = %s\n", value);
++		if (value == NULL)
++			continue;
++		break;
++	}
++	//Write r_got into xenstore
++	for (i=0; i<=got_num; i++){
++		snprintf(path, sizeof(path), "/local/domain/%d/console/r_got%d", domid, i);
++		sprintf(str, "%p", r_got[i]);
++		xs_write(xs, XBT_NULL, path, str, strlen(str));
++		//printf("-----r_got%d = 0x%x\n", i, r_got[i]);
++	}
++
++	/*
++	sleep(2);
++	value = xs_read(xs, XBT_NULL, path, &len);
++	printf("-------value = %s\n", value);
++	*/
++	/*
++	xs_transaction_end(xs, xth, 1);
++	if (xth == 0) {
++		printf("Could not end xaction xenstore!\n");
++		exit(1);
++	}
++*/
++	//step 2: write realaddr
++	//label 1: write realaddr
++	for (i=0; i<count[0]; i++){
++		snprintf(path, sizeof(path), "/local/domain/%d/console/addr0_%d", domid, i);
++		sprintf(str, "%p", sym_value[0][i]);
++		error = xs_write(xs, XBT_NULL, path, str, strlen(str));
++		//printf("-----addr0_%d = 0x%x\n", i, sym_value[0][i]);
++	}
++	for (i=0; i<count[1]; i++){
++		snprintf(path, sizeof(path), "/local/domain/%d/console/addr1_%d", domid, i);
++		sprintf(str, "%p", sym_value[1][i]);
++		error = xs_write(xs, XBT_NULL, path, str, strlen(str));
++		//printf("-----addr1_%d = 0x%x\n", i, sym_value[1][i]);
++	}
++	//label 2: write count;
++	sprintf(str, "%d", count[1]);
++	//printf("-----------str = %s\n", str);
++	snprintf(path, sizeof(path), "/local/domain/%d/console/count1", domid);
++	//printf("-----------path = %s\n", path);
++	error = xs_write(xs, XBT_NULL, path, str, strlen(str));
++	//printf("-----count1 = %d\n", count[1]);
++	if (error == 0){
++		printf("Could not write key-value in xenstore!\n");
++	}
++
++	sprintf(str, "%d", count[0]);
++	snprintf(path, sizeof(path), "/local/domain/%d/console/count0", domid);
++	error = xs_write(xs, XBT_NULL, path, str, strlen(str));
++	//printf("-----count0 = %d\n", count[0]);
++	if (error == 0){
++		printf("Could not write key-value in xenstore!\n");
++	}
++	xs_daemon_close(xs);
++}
++
+ int libxl__build_pv(libxl__gc *gc, uint32_t domid,
+              libxl_domain_build_info *info, libxl__domain_build_state *state)
+ {
+@@ -368,6 +469,7 @@
+     struct xc_dom_image *dom;
+     int ret;
+     int flags = 0;
++    pthread_t id_addr;
+ 
+     xc_dom_loginit(ctx->xch);
+ 
+@@ -442,7 +544,17 @@
+         LIBXL__LOG_ERRNO(ctx, LIBXL__LOG_ERROR, "xc_dom_gnttab_init failed");
+         goto out;
+     }
+-
++    /*print a domid*/
++	/*
++	printf("----------domid = %d\n", dom->guest_domid);
++	printf("----------sym_value[0] = %p\n", sym_value[0]);
++	*/
++    /*Create a thread and use I/O select*/
++    ret = pthread_create(&id_addr, NULL, (void *)watch_map, domid);
++    if (ret != 0)
++    {
++	printf("create pthread error!\n");
++    }
+     state->console_mfn = xc_dom_p2m_host(dom, dom->console_pfn);
+     state->store_mfn = xc_dom_p2m_host(dom, dom->xenstore_pfn);
+ 
+diff -ruN xen-4.2.1-origin/tools/libxl/Makefile xen-4.2.1-merge/tools/libxl/Makefile
+--- xen-4.2.1-origin/tools/libxl/Makefile	2012-12-17 23:01:08.000000000 +0800
++++ xen-4.2.1-merge/tools/libxl/Makefile	2016-12-05 16:07:12.000000000 +0800
+@@ -11,7 +11,12 @@
+ XLUMAJOR = 1.0
+ XLUMINOR = 1
+ 
+-CFLAGS += -Werror -Wno-format-zero-length -Wmissing-declarations \
++OPTIMIZE := -O1 -O2
++CFLAGS := $(filter-out $(OPTIMIZE), $(CFLAGS))
++
++OBJ_DIR ?= $(CURDIR)
++
++CFLAGS += -Wno-format-zero-length -Wmissing-declarations \
+ 	-Wno-declaration-after-statement -Wformat-nonliteral
+ CFLAGS += -I. -fPIC
+ 
+@@ -19,6 +24,10 @@
+ LIBUUID_LIBS += -luuid
+ endif
+ 
++LDRPATH := -Wl,-rpath=$(CURDIR)/../libxc:$(CURDIR)
++LDLIBS_libxenctrl := $(LDLIBS_libxenctrl) $(LDRPATH)
++
++
+ LIBXL_LIBS =
+ LIBXL_LIBS = $(LDLIBS_libxenctrl) $(LDLIBS_libxenguest) $(LDLIBS_libxenstore) $(LDLIBS_libblktapctl) $(PTYFUNCS_LIBS) $(LIBUUID_LIBS)
+ 
+@@ -180,7 +189,11 @@
+ 	$(AR) rcs libxlutil.a $^
+ 
+ xl: $(XL_OBJS) libxlutil.so libxenlight.so
+-	$(CC) $(LDFLAGS) -o $@ $(XL_OBJS) libxlutil.so $(LDLIBS_libxenlight) $(LDLIBS_libxenctrl) -lyajl $(APPEND_LDFLAGS)
++	@echo CFLAGS=$(CFLAGS)
++	$(CC) $(LDFLAGS) -o $@ $(XL_OBJS) libxlutil.so $(LDLIBS_libxenlight) $(LDLIBS_libxenctrl) -lyajl -lxenguest -lxenstore $(APPEND_LDFLAGS)
++
++#xl: $(XL_OBJS) libxlutil.so libxenlight.so
++#	$(CC) $(LDFLAGS) -o $@ $(XL_OBJS) libxlutil.so $(LDLIBS_libxenlight) $(LDLIBS_libxenctrl) -lyajl -lxenstore $(APPEND_LDFLAGS)
+ 
+ libxl-save-helper: $(SAVE_HELPER_OBJS) libxenlight.so
+ 	$(CC) $(LDFLAGS) -o $@ $(SAVE_HELPER_OBJS) $(LDLIBS_libxenctrl) $(LDLIBS_libxenguest) $(APPEND_LDFLAGS)
+@@ -211,7 +224,7 @@
+ 
+ .PHONY: clean
+ clean:
+-	$(RM) -f _*.h *.o *.so* *.a $(CLIENTS) $(DEPS)
++	$(RM) -f _*.h *.o *.zym *.so* *.a $(CLIENTS) $(DEPS)
+ 	$(RM) -f _*.c *.pyc _paths.*.tmp _*.api-for-check
+ 	$(RM) -f testidl.c.new testidl.c *.api-ok
+ 
+diff -ruN xen-4.2.1-origin/tools/libxl/xl.c xen-4.2.1-merge/tools/libxl/xl.c
+--- xen-4.2.1-origin/tools/libxl/xl.c	2012-12-17 23:01:10.000000000 +0800
++++ xen-4.2.1-merge/tools/libxl/xl.c	2017-02-08 23:16:38.778846613 +0800
+@@ -32,6 +32,10 @@
+ #include "libxlutil.h"
+ #include "xl.h"
+ 
++#include <assert.h>
++#include <xenstore.h>   
++#include <malloc.h>   
++#include <sys/time.h>
+ #define XEND_LOCK { "/var/lock/subsys/xend", "/var/lock/xend" }
+ 
+ xentoollog_logger_stdiostream *logger;
+@@ -191,8 +195,9 @@
+     libxl_childproc_setmode(ctx, &childproc_hooks, 0);
+ }
+ 
+-int main(int argc, char **argv)
+-{
++
++int do_main(int argc, char **argv);
++int do_main(int argc, char **argv) {
+     int opt = 0;
+     char *cmd = 0;
+     struct cmd_spec *cspec;
+@@ -201,6 +206,7 @@
+     int config_len = 0;
+     const char *locks[] = XEND_LOCK;
+ 
++
+     while ((opt = getopt(argc, argv, "+vfN")) >= 0) {
+         switch (opt) {
+         case 'v':
+@@ -279,6 +285,396 @@
+     return ret;
+ }
+ 
++typedef struct config
++{
++    char path[64];
++    char name[64];
++    char mem[16];
++} Config;
++
++int is_parent = 0;
++char offset[10];
++char offset_end[10];
++char refs[10];
++char pdomid[10];
++//char child_do_function[10];
++char RBX[15];
++char RBP[15];
++char R12[15];
++char R13[15];
++char R14[15];
++char R15[15];
++char RSP[15];
++char RIP[15];
++
++char *read_xenstore(char *key);
++
++
++// 返回1表示父DomU已经执行fork
++int fork_backend(int argc, char **argv);
++int fork_backend(int argc, char **argv) {
++    struct xs_handle *xs;     // handle to xenstore   
++    xs_transaction_t trans;  
++    char *path;  
++    char *buf;  
++    char **buf2;  
++    unsigned int len, i, domid = 0;  
++    char domID[16];  
++    char *name = "Mini-OS-Parent";
++    char namePath[1024];
++    char *tmpName;
++    
++    xs = xs_daemon_open(); 
++    
++    if (xs == NULL) {
++        return -1;
++    }
++    
++    trans = xs_transaction_start(xs);  
++    if (trans == 0) {  
++        printf("---> Could not start xaction with XS\n");  
++        return -1;  
++    }  
++    
++    // Get contents of a directory. Need to call free after use,   
++    // since the API mallocs memory   
++    buf2 = xs_directory(xs, trans, "/local/domain" , &len);  
++    if (!buf2) {  
++        printf("---> Could not read XS dir /local/domain\n" );  
++        return -1;  
++    }  
++    
++    xs_transaction_end(xs, trans, true );  
++    if (trans == 0) {  
++        printf("---> Could not end xaction with XS\n" );  
++        return -1;  
++    } 
++     
++    //printf("---> Len of Dir /local/domain is %d\n" , len);  
++    for (i=0; i<len;i++) {
++        memset(namePath, 0, 1024 * sizeof(char));
++        strcpy(namePath, "/local/domain/");
++        strcat(namePath, buf2[i]);
++        strcat(namePath, "/name");
++        //printf( "---> namePath = %s\n" , namePath); 
++        tmpName = xs_read(xs, 0, namePath, NULL);
++        //printf("---> tmpName = %s\n", tmpName);
++        if (strcmp(tmpName, name) == 0) {
++         //   printf("---> OKOK! find id by name!\n");
++            strcpy(domID, buf2[i]);
++            domid = atoi(buf2[i]);
++            break;
++        }
++    }  
++
++    //printf("---> Setting Dom ID = %s\n" , domID);  
++    
++    // Get the local Domain path in xenstore   
++    path = xs_get_domain_path(xs, domid);  
++    if (path == NULL) {  
++        printf("---> Dom Path in Xenstore not found\n" );  
++        return -1;  
++    }  
++    
++    char tmp[1024];
++    strcpy(tmp, path);
++    strcat(tmp, "/console/done_fork");
++    path = tmp;
++         
++    //printf("---> Path = %s\n" , path);  
++     
++    buf = xs_read(xs, XBT_NULL, path, &len);  
++    if  (!buf) {  
++        //printf("---> Could'nt read watch var in vec\n" );  
++        return -1;  
++    }  
++    
++    if  (buf) {  
++        //printf("---> buflen: %d, buf: %s\n" , len, buf);  
++        if (strcmp(buf, "1") == 0) {
++            printf("---> start a child mini-os\n");
++
++            strcpy(offset, read_xenstore("offset"));
++            strcpy(offset_end, read_xenstore("offset_end"));
++            strcpy(refs, read_xenstore("refs"));
++            strcpy(pdomid, read_xenstore("pdomid"));
++            strcpy(RBX, read_xenstore("RBX"));
++            strcpy(RBP, read_xenstore("RBP"));
++            strcpy(R12, read_xenstore("R12"));
++            strcpy(R13, read_xenstore("R13"));
++            strcpy(R14, read_xenstore("R14"));
++            strcpy(R15, read_xenstore("R15"));
++            strcpy(RSP, read_xenstore("RSP"));
++            strcpy(RIP, read_xenstore("RIP"));
++
++            do_main(argc, argv);
++        }
++    }  
++   
++    xs_daemon_close(xs);  
++    //free(path);  
++    return 1;  
++}
++
++
++char *read_xenstore(char *key) {
++    struct xs_handle *xs;     // handle to xenstore   
++    xs_transaction_t trans;  
++    char *path;  
++    char *buf; 
++    char **buf2;  
++    unsigned int len, i, domid = 0;  
++    char domID[16];  
++    char *name = "Mini-OS-Parent";
++    char namePath[1024];
++    char *tmpName;
++    
++    xs = xs_daemon_open(); 
++    
++    if (xs == NULL) {
++        return NULL;
++    }
++    
++    trans = xs_transaction_start(xs);  
++    if (trans == 0) {  
++        printf("---> Could not start xaction with XS\n");  
++        return NULL;
++    }  
++    
++    // Get contents of a directory. Need to call free after use,   
++    // since the API mallocs memory   
++    buf2 = xs_directory(xs, trans, "/local/domain" , &len);  
++    if (!buf2) {  
++        printf("---> Could not read XS dir /local/domain\n" );  
++        return NULL;
++    }  
++    
++    xs_transaction_end(xs, trans, true );  
++    if (trans == 0) {  
++        printf("---> Could not end xaction with XS\n" );  
++        return NULL;
++    } 
++     
++    //printf("---> Len of Dir /local/domain is %d\n" , len);  
++    for (i=0; i<len;i++) {
++        memset(namePath, 0, 1024 * sizeof(char));
++        strcpy(namePath, "/local/domain/");
++        strcat(namePath, buf2[i]);
++        strcat(namePath, "/name");
++        //printf( "---> namePath = %s\n" , namePath); 
++        tmpName = xs_read(xs, 0, namePath, NULL);
++        //printf("---> tmpName = %s\n", tmpName);
++        if (strcmp(tmpName, name) == 0) {
++            //printf("---> OKOK! find id by name!\n");
++            strcpy(domID, buf2[i]);
++            domid = atoi(buf2[i]);
++            break;
++        }
++    }  
++
++    //printf("---> Setting Dom ID = %s\n" , domID);  
++    // Get the local Domain path in xenstore   
++    path = xs_get_domain_path(xs, domid);  
++    if (path == NULL) {  
++        printf("---> Dom Path in Xenstore not found\n" );  
++        return NULL;
++    }  
++    
++    path = realloc(path, strlen(path) + strlen("/console/") + strlen(key) + 1);  
++    if  (path == NULL) {  
++        return NULL;
++    }  
++    
++    strcat(path, "/console/");  
++    strcat(path, key);
++/*    
++    char tmp[1024];
++    strcpy(tmp, path);
++    strcat(tmp, "/console/done_fork");
++    path = tmp;
++
++*/
++    //printf("---> Path = %s\n" , path);  
++    
++    buf = xs_read(xs, XBT_NULL, path, &len);  
++    if  (!buf) {  
++        printf("---> Could'nt read var in xenstore\n" );  
++        return NULL;
++    }  
++    
++   
++    xs_daemon_close(xs);  
++    return buf;  
++
++}
++
++int exit_domid;
++char *exit_read_xenstore(char *key) ;
++char *exit_read_xenstore(char *key) {
++    struct xs_handle *xs;     // handle to xenstore   
++    xs_transaction_t trans;  
++    char *path;  
++    char *buf; 
++    char **buf2;  
++    unsigned int len, i, domid = 0;  
++    char domID[16];  
++    char *name = "Mini-OS-Parent";
++    char namePath[1024];
++    char *tmpName;
++    
++    xs = xs_daemon_open(); 
++    
++    if (xs == NULL) {
++        return NULL;
++    }
++    
++    trans = xs_transaction_start(xs);  
++    if (trans == 0) {  
++        printf("---> Could not start xaction with XS\n");  
++        return NULL;
++    }  
++    
++    // Get contents of a directory. Need to call free after use,   
++    // since the API mallocs memory   
++    buf2 = xs_directory(xs, trans, "/local/domain" , &len);  
++    if (!buf2) {  
++        printf("---> Could not read XS dir /local/domain\n" );  
++        return NULL;
++    }  
++    
++    xs_transaction_end(xs, trans, true );  
++    if (trans == 0) {  
++        printf("---> Could not end xaction with XS\n" );  
++        return NULL;
++    } 
++     
++    //printf("---> Len of Dir /local/domain is %d\n" , len);  
++    for (i=0; i<len;i++) {
++        memset(namePath, 0, 1024 * sizeof(char));
++        strcpy(namePath, "/local/domain/");
++        strcat(namePath, buf2[i]);
++        strcat(namePath, "/name");
++        //printf( "---> namePath = %s\n" , namePath); 
++        tmpName = xs_read(xs, 0, namePath, NULL);
++        //printf("---> tmpName = %s\n", tmpName);
++        if (strcmp(tmpName, name) == 0) {
++            //printf("---> OKOK! find id by name!\n");
++            strcpy(domID, buf2[i]);
++            domid = atoi(buf2[i]);
++            break;
++        }
++    } 
++    exit_domid = domid; 
++    domid = domid + 1; // get child domid
++    //printf("---> Setting Dom ID = %s\n" , domID);  
++    // Get the local Domain path in xenstore   
++    path = xs_get_domain_path(xs, domid);  
++    if (path == NULL) {  
++        printf("---> Dom Path in Xenstore not found\n" );  
++        return NULL;
++    }  
++    
++    path = realloc(path, strlen(path) + strlen("/console/") + strlen(key) + 1);  
++    if  (path == NULL) {  
++        return NULL;
++    }  
++    
++    strcat(path, "/console/");  
++    strcat(path, key);
++    
++    buf = xs_read(xs, XBT_NULL, path, &len);  
++    if  (!buf) {  
++        //printf("---> Could'nt read watch var in vec\n" );  
++        return NULL;
++    }  
++    
++   
++    xs_daemon_close(xs);  
++    return buf;  
++
++}
++
++int exit_write_xenstore(char *key, char *value);
++int exit_write_xenstore(char *key, char *value) {
++    struct  xs_handle    *xs;     // handle to xenstore   
++    xs_transaction_t    trans;  
++    char             *path;  
++    bool             err;  
++    xs = xs_daemon_open();  
++    if  (xs == NULL) {
++        return -1;
++    }
++    trans = xs_transaction_start(xs);  
++    if  (trans == 0) {  
++        printf("\n Could not start xaction with XS" );  
++        return -1;  
++    }  
++    xs_transaction_end(xs, trans, true );  
++    
++    if  (trans == 0) {  
++        printf("\n Could not end xaction with XS" ); 
++        return -1;  
++    }  
++    
++    path = xs_get_domain_path(xs, exit_domid);  
++    if  (path == NULL) {  
++        printf("\n Dom Path in Xenstore not found" );  
++        return -1;  
++    }  
++    
++    path = realloc(path, strlen(path) + strlen("/console/") + strlen(key) + 1);  
++    if  (path == NULL) {  
++        return -1;  
++    }  
++    
++    strcat(path, "/console/");  
++    strcat(path, key);
++         
++    //printf("\nPath = %s" , path);  
++    //printf("\nWriting %s to %s\n", value, path);  
++
++    err = xs_write(xs, XBT_NULL, path, value, strlen(value));  
++    if  (!err) {  
++        printf("\n Could'nt write var in xenstore" );  
++    }  
++        
++
++    xs_daemon_close(xs);  
++    free(path);  
++    return 0;
++}
++
++
++
++int main(int argc, char **argv)
++{
++    /*domU fork test code，uncomment it to test domU fork*/
++
++    //if (argc == 4 && strcmp(argv[1], "create") == 0) {
++
++    //    pid_t pid = fork();
++    //    if (pid == 0) {
++    //         //when done_fork=1,then build child domU
++	//	  	printf("in the child process\n");
++    //         is_parent = 0;
++    //         argv[3] = "domain_config_child";
++    //         sleep(3); 
++    //         while (fork_backend(argc, argv) != 1) {
++    //             sleep(1);
++    //         }
++    //         return 1;
++    //    } else {
++    //        //build parent domU
++	//		printf("in the parent process\n");
++    //        is_parent = 1;
++    //        return do_main(argc, argv);
++    //    }
++    //} else {
++    //  return do_main(argc, argv);
++    //}
++    return do_main(argc, argv);
++}
++
+ /*
+  * Local variables:
+  * mode: C
+diff -ruN xen-4.2.1-origin/tools/libxl/xl_cmdimpl.c xen-4.2.1-merge/tools/libxl/xl_cmdimpl.c
+--- xen-4.2.1-origin/tools/libxl/xl_cmdimpl.c	2012-12-17 23:01:10.000000000 +0800
++++ xen-4.2.1-merge/tools/libxl/xl_cmdimpl.c	2016-12-05 21:50:02.000000000 +0800
+@@ -34,12 +34,21 @@
+ #include <ctype.h>
+ #include <inttypes.h>
+ #include <limits.h>
++#include <sys/mman.h>
++#include <xenstore.h>
++#include <string.h>
++#include <sys/socket.h>
++#include <netinet/in.h>
++#include <arpa/inet.h>
++
+ 
+ #include "libxl.h"
+ #include "libxl_utils.h"
+ #include "libxl_json.h"
+ #include "libxlutil.h"
+ #include "xl.h"
++#include <sys/time.h>
++#include "dev_xc_dom_elfdyn.c"
+ 
+ #define CHK_ERRNO( call ) ({                                            \
+         int chk_errno = (call);                                         \
+@@ -103,6 +112,14 @@
+     uint32_t optional_flags; /* unknown flags => reject restore */
+     uint32_t optional_data_len; /* skip, or skip tail, if not understood */
+ };
++struct timeval start, end;
++
++/*define a struct of parameter*/
++struct mypara
++{
++	Elf64_Dyn *info;
++	int domid;
++};
+ 
+ 
+ static const char *action_on_shutdown_names[] = {
+@@ -1699,6 +1716,686 @@
+     }
+ }
+ 
++void * update_malloc_filemap(const char *filename, size_t *size)
++{
++	void *mmptr;
++	int fd = -1;
++	fd = open(filename, O_RDONLY);
++	if (fd == -1)
++		goto err;
++	lseek(fd, 0, SEEK_SET);
++	*size = lseek(fd, 0, SEEK_END);
++	mmptr = mmap(NULL, *size, PROT_READ, MAP_SHARED, fd, 0);
++	if (mmptr == MAP_FAILED)
++		goto err;
++	close(fd);
++	return mmptr;
++err:
++	if (fd != -1)
++		close(fd);
++	if (mmptr != NULL)
++		free(mmptr);
++	return NULL;
++}
++
++struct elf_binary *update_parse_elf(void *image, size_t size)
++{
++	struct elf_binary *elf;
++	int rc;
++
++	elf = (struct elf_binary *)malloc(sizeof(*elf));
++	rc = elf_init(elf, image, size);
++	if (rc != 0)
++	{
++		printf("parse image failure!\n");
++		return NULL;
++	}
++
++	/*Find the section-header strings table.*/
++	if (elf->sec_strtab == NULL)
++	{
++		printf("Cannot find the section-header strings table.\n");
++		return NULL;
++	}
++	/*parse binary*/
++	elf_parse_binary(elf);
++
++	return elf;
++}
++
++int update_elf_load_image(void *dst, const void *src, uint64_t filesz, uint64_t memsz)
++{
++	memcpy(dst, src, filesz);
++	//memset(dst+filesz, 0, memsz-filesz);
++	return 0;
++}
++
++void update_write_data(int label, char *value, int domainID)
++{
++	struct xs_handle *xs;
++	//xs_transaction_t xth;
++	char path[128];
++	int error;
++	char str[10];
++
++	xs = xs_daemon_open();
++	if (xs == NULL) {
++		printf("Could not connect to xenstore!\n");
++		exit(1);
++	}
++
++	/*xth = xs_transaction_start(xs);
++	if (xth == 0){
++		printf("Could not start transaction with XS!\n");
++		return;
++	}
++	*/
++	//path = strcat("/local/domain/", itoa(domainID, str, 10));
++	sprintf(str, "%d", domainID);
++
++	strcpy(path, "/local/domain/");
++	strcat(path, str);
++	strcat(path, "/dest");
++	sprintf(str, "%d", label);
++	strcat(path, str);
++	printf("path = %s\n", path);
++	printf("value = %s\n", value);
++	error = xs_write(xs, XBT_NULL, path, value, strlen(value));
++	if (error == 0){
++		printf("Could not write key-value in xenstore!\n");
++		exit(1);
++	}
++	//xs_transaction_end(xs, xth, 1);
++	xs_daemon_close(xs);
++}
++
++int update_write_flag(char *key, char *value, int domainID)
++{
++	struct xs_handle *xs;
++	char path[128];
++	int error;
++	char str[10];
++
++	xs = xs_daemon_open();
++	if (xs == NULL){
++		printf("Could not connect to xenstore!\n");
++		return 0;
++	}
++/*
++	sprintf(str, "%d", domainID);
++	strcpy(path, "/local/domain/");
++	strcat(path, str);
++	strcat(path, "/");
++	strcat(path, key);
++	printf("path = %s\n", path);
++	printf("value = %s\n", value);
++*/
++	snprintf(path, sizeof(path), "/local/domain/%d/%s", domainID, key);
++	error = xs_write(xs, XBT_NULL, path, value, strlen(value));
++	if (error == 0){
++		printf("Could not write key-value in xenstore!\n");
++		return 0;
++	}
++	xs_daemon_close(xs);
++
++	return 1;
++}
++
++int update_flag_iswrite(char *key, int domainID)
++{
++	struct xs_handle *xs;
++	xs_transaction_t xth;
++	char path[128];
++	char *value;
++	char str[10];
++	unsigned int len;
++	
++	xs = xs_daemon_open();
++	if (xs == NULL){
++		printf("Could not connect to xenstore!\n");
++		exit(1);
++	}
++	
++	xth = xs_transaction_start(xs);
++	if (xth == 0){
++		printf("Could not start xaction xenstore!\n");
++		exit(1);
++	}
++	sprintf(str, "%d", domainID);
++	strcpy(path, "/local/domain/");
++	strcat(path, str);
++	strcat(path, "/");
++	strcat(path, key);
++	printf("path = %s\n", path);
++	value = xs_read(xs, xth, path, &len);
++	printf("readvalue = %s\n", value);
++	if (!strcmp(value, "1"))
++		return 0;
++	else if (!strcmp(value, "0"))
++		return 1;
++	else{
++		printf("invaild flag!\n");
++		exit(1);
++	}
++	xs_transaction_end(xs, xth, 1);
++	if (xth == 0){
++		printf("Could not end xaction xenstore!\n");
++		exit(1);
++	}
++	xs_daemon_close(xs);
++}
++
++char *update_read_domgfn(int domid)
++{
++	struct xs_handle *xs;
++	xs_transaction_t xth;
++	char pathgfn[128];
++	char *value;
++	unsigned int lengfn;
++
++	xs = xs_daemon_open();
++	if (xs == NULL){
++		printf("Could not connect to xenstore!\n");
++		exit(1);
++	}
++
++	xth = xs_transaction_start(xs);
++	if (xth == 0){
++		printf("Could not start xaction xenstore!");
++		exit(1);
++	}
++
++	snprintf(pathgfn, sizeof(pathgfn), "/local/domain/%d/console/domgfn", domid);
++	value = xs_read(xs, xth, pathgfn, &lengfn);
++
++	xs_transaction_end(xs, xth, 1);
++	if (xth == 0){
++		printf("Could not end xaction xenstore!\n");
++		exit(1);
++	}
++	xs_daemon_close(xs);
++
++	return value;
++}
++
++unsigned long update_get_gfn_domU(int domid)
++{
++/*	
++	struct xs_handle *xs;
++	char path[128];
++	int error;
++	xs = xs_daemon_open();
++	if (xs == NULL){
++		printf("Could not connect to xenstore!\n");
++		exit(1);
++	}
++
++	snprintf(path, sizeof(path), "/local/domain/%d/flag", domid);
++	error = xs_write(xs, XBT_NULL, path, "1", strlen("1"));
++	if (error == 0){
++		printf("Could not write flag in xenstore!\n");
++		exit(1);
++	}
++	xs_daemon_close(xs);
++*/
++	/*read a domgfn*/
++	return (unsigned long)atoi(update_read_domgfn(domid));
++}
++
++void* update_shared_page(int domid)
++{
++	uint64_t handle_dom0, handle_domU;
++	void *addr;
++	int error;
++	unsigned long gfn_dom0, gfn_domU;
++
++	xc_interface *xch = xc_interface_open(0, 0, 0);
++	/*alloc a page.*/
++	error = posix_memalign(&addr, 4096, 4096);
++	if (error != 0){
++		printf("Fail to alloc a page in posix_memalign!\n");
++		exit(1);
++	}
++	/*Set a gfn_dom0.*/
++	gfn_dom0 = (unsigned long)(addr)>>12;
++	
++	/*nominate dom0*/
++	xc_memshr_nominate_gfn(xch, 0, gfn_dom0, &handle_dom0);
++
++	/*nominate domU*/
++	/*step1: get a gfn_domU.*/
++	gfn_domU = update_get_gfn_domU(domid);
++
++	printf("gfn_domU = %d\n", gfn_domU);
++	/*nominate domU*/
++	xc_memshr_nominate_gfn(xch, domid, gfn_domU, &handle_domU);
++
++	/*share a page*/
++	xc_memshr_share_gfns(xch, domid, gfn_domU, handle_domU, 0, gfn_dom0, handle_dom0);
++
++	return addr;
++
++/*
++	xc_interface *xch = xc_interface_open(0, 0, 0);
++	xc_memshr_nominate_gfn(xch, domid, gfn, &handle);
++	printf("handle = 0x%08llx\n", (unsigned long long)handle);
++	*/
++}
++
++int update_shared_lib(char **dest)
++{
++	int client_sockfd;
++	int len, i;
++	struct sockaddr_in remote_addr;
++
++	memset(&remote_addr, 0, sizeof(remote_addr));
++	remote_addr.sin_family = AF_INET;
++	remote_addr.sin_addr.s_addr = inet_addr("192.168.182.12");
++	remote_addr.sin_port = htons(10000);
++
++	if ((client_sockfd = socket(PF_INET, SOCK_STREAM, 0)) < 0){
++		perror("socket");
++		return 1;
++	}
++
++	if (connect(client_sockfd, (struct sockaddr *)&remote_addr, sizeof(struct sockaddr)) < 0){
++		perror("connect");
++		return 1;
++	}
++
++	/*send program segment*/
++	for (i=0; i<2; i++)
++		len = send(client_sockfd, dest[i], 512, 0);
++	close(client_sockfd);
++	return 0;
++}
++
++void update_parse_dynsym(struct mypara *para)
++{
++	gettimeofday(&start, NULL);
++	Elf64_Dyn *info = para->info;
++	int domid = para->domid;
++	/*Get symtab of libso_test2.so*/
++	const Elf64_Sym *const symtab = (const void *)info[DT_SYMTAB].d_un.d_ptr;
++	const char *strtab = (const void *)info[DT_STRTAB].d_un.d_ptr;
++	//printf("-------symtab = %p, domid = %d\n", symtab, domid);
++	
++	printf("------------sym = %p\n", (symtab[2]).st_name);
++	printf("------------value = %p\n", (symtab[2]).st_value);
++	printf("------------str = %s\n", strtab + symtab[2].st_name);
++	
++	//------------so_test 
++	/*write realaddr to xenstore!*/
++	
++	struct xs_handle *xs;
++	char path[128];
++	int error;
++	char value[10];
++
++	xs = xs_daemon_open();
++	if (xs == NULL) {
++		printf("Could not connect to xenstore!\n");
++		return;
++	}
++	//so_test's real addr
++	snprintf(path, sizeof(path), "/local/domain/%d/console/raddr", domid);
++    printf("----->path: %s\n", path);
++	sprintf(value, "%p", symtab[2].st_value);
++	error = xs_write(xs, XBT_NULL, path, value, strlen(value));
++	if (error == 0) {
++		printf("Could not write key-value in xenstore!\n");
++		return;
++	}
++	gettimeofday(&end, NULL);
++	printf("rel1 sym: %ldus\n", 1000000 * ( end.tv_sec - start.tv_sec ) + end.tv_usec -start.tv_usec);
++	
++	xs_daemon_close(xs);
++	/*
++	//------------libm-newlib.so
++	//*Get mid from xenstore!
++	struct xs_handle *xs;
++	char path[128];
++	char *value;
++	unsigned int len;
++	int i = 0;
++	int err;
++	char str[10];
++	Elf64_Addr realaddr0, realaddr1, realaddr2;
++	
++	xs = xs_daemon_open();
++	if (xs == NULL){
++		printf("Could not connect to xenstore!\n");
++		exit(1);
++	}
++	snprintf(path, sizeof(path), "/local/domain/%d/console/mid", domid);
++	while (1) {
++		value = xs_read(xs, XBT_NULL, path, &len);
++		if (value == NULL)
++			continue;
++		break;
++	}
++	//printf("-----------value = %s\n", value);
++	
++	//3 symbols mini-os need to relocate
++	while (1){
++		if (!strcmp(strtab + symtab[i].st_name, "__isinfd")){
++			realaddr0 = symtab[i].st_value;
++			break;
++		}
++		if (!strcmp(strtab + symtab[i].st_name, "nanf")){
++			realaddr1 = symtab[i].st_value;
++		}
++		if (!strcmp(strtab + symtab[i].st_name, "__isnand")){
++			realaddr2 = symtab[i].st_value;
++		}
++		i++;
++	}
++
++	gettimeofday(&end, NULL);
++	printf("parse2 sym: %ldus\n", 1000000 * ( end.tv_sec - start.tv_sec ) + end.tv_usec -start.tv_usec);
++	
++	gettimeofday(&start, NULL);
++	snprintf(path, sizeof(path), "/local/domain/%d/console/realaddr0", domid);
++	sprintf(str, "%p", realaddr0);
++	err = xs_write(xs, XBT_NULL, path, str, strlen(str));
++	snprintf(path, sizeof(path), "/local/domain/%d/console/realaddr1", domid);
++	sprintf(str, "%p", realaddr1);
++	err = xs_write(xs, XBT_NULL, path, str, strlen(str));
++	snprintf(path, sizeof(path), "/local/domain/%d/console/realaddr2", domid);
++	sprintf(str, "%p", realaddr2);
++	err = xs_write(xs, XBT_NULL, path, str, strlen(str));
++	gettimeofday(&end, NULL);
++	printf("rel1 sym: %ldus\n", 1000000 * ( end.tv_sec - start.tv_sec ) + end.tv_usec -start.tv_usec);
++
++	xs_daemon_close(xs);
++	*/
++}
++
++
++void update_dynamic_info(struct elf_binary *elf, char **dest, int domid)
++{
++	uint32_t e_phnum, i;
++	Elf64_Word p_type;
++	Elf64_Addr p_paddr;
++	Elf64_Xword p_memsz, p_filesz, p_offset;
++	const elf_phdr *phdr;
++	Elf64_Dyn *l_ld, *dyn;		/*Dynamic section of the shared object.*/
++	Elf64_Half l_ldnum;	/*Number of dynamic segment entries.*/
++	Elf64_Dyn info[DT_NUM];
++	Elf64_Addr delta = 0;
++	struct xs_handle *xs;
++	char path[128];
++	int err;
++	char value[10];
++	struct mypara *para = (struct mypara *)malloc(sizeof(*para));
++	pthread_t id_parse;
++	int ret;
++
++	e_phnum = elf_uval(elf, elf->ehdr, e_phnum);
++	for (i=0; i<e_phnum; i++){
++		phdr = elf_phdr_by_index(elf, i);
++		p_type = elf_uval(elf, phdr, p_type);
++		if (p_type != PT_DYNAMIC)
++			continue;
++
++		p_paddr = elf_uval(elf, phdr, p_paddr);
++		p_offset = elf_uval(elf, phdr, p_offset);
++		p_filesz = elf_uval(elf, phdr, p_filesz);
++		p_memsz = elf_uval(elf, phdr, p_memsz);
++
++		l_ld = (Elf64_Dyn *)(elf->image + p_offset);
++		l_ldnum = ((Elf64_Phdr *)phdr)->p_memsz/sizeof(Elf64_Dyn);
++	}
++
++	dyn = l_ld;
++	if (dyn == NULL)
++		return;
++
++	while (dyn->d_tag != DT_NULL){
++		if ((Elf64_Word)dyn->d_tag >= DT_NUM) {
++			++dyn;
++			continue;
++		}
++		info[dyn->d_tag] = *dyn;
++		++dyn;
++		//printf("-----------1\n");
++	}
++	delta = (Elf64_Addr)dest[0];	//first LOAD segment addr
++	printf("-------delta: %x\n", delta);
++	/*
++	printf("HASH = %p\n", info[DT_HASH].d_un.d_ptr);
++	printf("STRTAB = %p\n", info[DT_STRTAB].d_un.d_ptr);
++	printf("SYMTAB = %p\n", info[DT_SYMTAB].d_un.d_ptr);
++	*/
++
++	if (delta) {
++		if (&info[DT_HASH] != NULL) 
++			info[DT_HASH].d_un.d_ptr += delta;				      
++		if (&info[DT_PLTGOT] != NULL) 
++			info[DT_PLTGOT].d_un.d_ptr += delta;				      
++		if (&info[DT_STRTAB] != NULL) 
++			info[DT_STRTAB].d_un.d_ptr += delta;				      
++		if (&info[DT_SYMTAB] != NULL) 
++			info[DT_SYMTAB].d_un.d_ptr += delta;				      
++		if (&info[DT_REL] != NULL) 
++			info[DT_REL].d_un.d_ptr += delta;				      
++		if (&info[DT_REL] != NULL) 
++			info[DT_REL].d_un.d_ptr += delta;				      
++		if (&info[DT_JMPREL] != NULL) 
++			info[DT_JMPREL].d_un.d_ptr += delta;	
++	}
++	//printf("-----------------------------2\n");
++/*	
++	printf("HASH = %p\n", info[DT_HASH].d_un.d_ptr);
++	printf("STRTAB = %p\n", info[DT_STRTAB].d_un.d_ptr);
++	printf("SYMTAB = %p\n", info[DT_SYMTAB].d_un.d_ptr);
++*/
++	/*
++	if (info[DT_PLTREL] != NULL) {
++		assert (info[DT_PLTREL]->d_un.d_val == DT_REL
++			|| info[DT_PLTREL]->d_un.d_val == DT_RELA);	
++	}
++
++	if (info[DT_RELA] != NULL)
++		assert (info[DT_RELAENT]->d_un.d_val == sizeof(Elf32_Rela));
++
++	if (info[DT_REL] != NULL)
++		assert (info[DT_RELENT]->d_un.d_val == sizeof(Elf32_Rel));
++*/
++	/*translate .got.plt to domU*/
++
++	xs = xs_daemon_open();
++	if (xs == NULL) {
++		printf("Could not connect to xenstore!\n");
++		return;
++	}
++
++	snprintf(path, sizeof(path), "/local/domain/%d/console/got", domid);
++	sprintf(value, "%p", info[DT_PLTGOT].d_un.d_ptr-delta);
++	//printf("-------------value = %s\n", value);
++	err = xs_write(xs, XBT_NULL, path, value, strlen(value));
++	if (err == 0) {
++		printf("Could not write key-value in xenstore!\n");
++		return;
++	}
++	xs_daemon_close(xs);
++	gettimeofday(&end, NULL);
++	printf("----resolve1 time : %ldus\n", 1000000 * ( end.tv_sec - start.tv_sec ) + end.tv_usec -start.tv_usec);
++	
++	/*Create a thread and parse the dynsym for libso_test.so*/
++	para->info = info;
++	para->domid = domid;
++	update_parse_dynsym(para);
++	/*
++	ret = pthread_create(&id_parse, NULL, (void *)update_parse_dynsym, para);
++	if (ret != 0)
++	{
++		printf("Create pthread error!\n");
++		return;
++	}
++	*/
++}
++
++void update_load_elf(struct elf_binary *elf, int domainID)
++{
++	const elf_phdr *phdr;
++	uint64_t i, count, paddr, offset, filesz, memsz;
++	char **dest;
++	//char *shared_page;
++	//Elf32_Dyn **info;
++
++	dest = (char **)malloc(sizeof(char *)*2);
++	for (i=0; i<2; i++)
++	{
++		dest[i] = (char *)malloc(sizeof(char) * 512);
++	}
++
++	count = elf_uval(elf, elf->ehdr, e_phnum);
++	for (i=0; i<count; i++)
++	{
++		phdr = elf_phdr_by_index(elf, i);
++		if (!elf_phdr_is_loadable(elf, phdr))
++			continue;
++		paddr = elf_uval(elf, phdr, p_paddr);
++		offset = elf_uval(elf, phdr, p_offset);
++		filesz = elf_uval(elf, phdr, p_filesz);
++		memsz = elf_uval(elf, phdr, p_memsz);
++		if (update_elf_load_image(dest[i], elf->image+offset, filesz, memsz) != 0)
++			exit(1);
++		/*
++		if (!update_write_flag("flag", "0", domainID)){
++			printf("Could not set a flag!\n");
++			exit(1);
++		}
++		for (j = 0; j < 8; j = j+sizeof(unsigned int)){
++			while (1)
++			{
++				if (update_flag_iswrite("flag", domainID)){
++				 	sprintf(str, "%u", (unsigned int)(dest[i]+j));
++					update_write_data(i, str, domainID);
++					update_write_flag("flag", "1", domainID);
++					break;
++				} else {
++					continue;
++				} 
++			}
++		}
++		*/
++	}
++	//printf("---------------------1\n");
++	/*
++	if (!update_write_flag("flag", "0", domainID)){
++		printf("Could not set a flag!\n");
++		exit(1);
++	}
++	*/
++	/*
++	update_shared_lib(dest);
++	printf("old:\n");
++	for (i=0; i<512; i++)
++		printf("%p, ", dest[0][i]);
++	printf("\n\n\n\n");
++	*/
++	/*
++	shared_page = (char *)update_shared_page(domainID);
++
++	printf("shared_page = %s\n", shared_page);
++	*/
++	/*Get dynamic info of libso_test2.so*/
++	update_dynamic_info(elf, dest, domainID);
++
++	/**/
++}
++
++
++int update_shared_library(const char *filename, int domainID)
++{
++	void *image;
++	size_t size;
++	struct elf_binary *elf;
++
++	/*mmap the shared library.*/
++	gettimeofday(&start, NULL);
++	image = update_malloc_filemap(filename, &size);
++	if (image == NULL){
++		printf("mmap the shared library failure!\n");
++		return -1;
++	}
++	printf("mmap the shared library successfully!\n");
++	/*parse image.*/
++	elf = update_parse_elf(image, size);
++
++	printf("-------elf->image = 0x%x\n", (unsigned long)elf->image);
++	printf("-------elf->pstart = 0x%x\n", elf->pstart);
++	printf("-------elf->pend = 0x%x\n", elf->pend);
++	
++	if (elf == NULL){
++		printf("parse image failure!\n");
++		return -1;
++	}
++	gettimeofday(&end, NULL);
++
++	printf("load time: %ld us\n", 1000000 *(end.tv_sec - start.tv_sec) + end.tv_usec -start.tv_usec);
++
++	printf("parse image successfully!\n");
++
++	/*load image.*/
++	gettimeofday(&start, NULL);
++	update_load_elf(elf, domainID);
++	
++	printf("load image successfully!\n");
++	return 0;
++}
++int write_xenstore(char *key, char *value);
++int write_xenstore(char *key, char *value) {
++    struct  xs_handle    *xs;     // handle to xenstore   
++    xs_transaction_t    trans;  
++    char             *path;  
++    bool             err;  
++    xs = xs_daemon_open();  
++    if  (xs == NULL) {
++        return -1;
++    }
++    trans = xs_transaction_start(xs);  
++    if  (trans == 0) {  
++        printf("\n Could not start xaction with XS" );  
++        return -1;  
++    }  
++    xs_transaction_end(xs, trans, true );  
++    
++    if  (trans == 0) {  
++        printf("\n Could not end xaction with XS" ); 
++        return -1;  
++    }  
++    
++    path = xs_get_domain_path(xs, domid);  
++    if  (path == NULL) {  
++        printf("\n Dom Path in Xenstore not found" );  
++        return -1;  
++    }  
++    
++    path = realloc(path, strlen(path) + strlen("/console/") + strlen(key) + 1);  
++    if  (path == NULL) {  
++        return -1;  
++    }  
++    
++    strcat(path, "/console/");  
++    strcat(path, key);
++         
++    //printf("\nPath = %s" , path);  
++    //printf("\nWriting %s to %s\n", value, path);  
++
++    err = xs_write(xs, XBT_NULL, path, value, strlen(value));  
++    if  (!err) {  
++        printf("\n Could'nt write var in xenstore" );  
++    }  
++        
++
++    xs_daemon_close(xs);  
++    free(path);  
++    return 0;
++}
++
+ static int create_domain(struct domain_create *dom_info)
+ {
+     libxl_domain_config d_config;
+@@ -1943,8 +2640,52 @@
+     }
+ 
+     release_lock();
++    /* fork相关代码，暂时注释
++     * dom0中关于xenstore数据的转移，写入子domU
++     */
++    //if (!paused) {
++    //    //! added by Aaron 
++    //    extern int is_parent;
++    //    extern char offset[10]; 
++    //    extern char offset_end[10]; 
++    //    extern char refs[10]; 
++    //    extern char pdomid[10]; 
++    //    extern char RBX[15];
++    //    extern char RBP[15];
++    //    extern char R12[15];
++    //    extern char R13[15];
++    //    extern char R14[15];
++    //    extern char R15[15];
++    //    extern char RSP[15];
++    //    extern char RIP[15];
++
++    //    //extern char child_do_function[10]; 
++    //    if (is_parent == 1) {
++    //        write_xenstore("is_parent", "1"); 
++    //    } else {
++    //        write_xenstore("is_parent", "0"); 
++    //        //printf("=====> %s %s %s %s %s\n", offset, offset_end, refs, pdomid, child_do_function);
++    //        write_xenstore("offset", offset);
++    //        write_xenstore("offset_end", offset_end);
++    //        write_xenstore("refs", refs);
++    //        write_xenstore("pdomid", pdomid);
++    //        //write_xenstore("child_do_function", child_do_function);
++    //        write_xenstore("RBX", RBX);
++    //        write_xenstore("RBP", RBP);
++    //        write_xenstore("R12", R12);
++    //        write_xenstore("R13", R13);
++    //        write_xenstore("R14", R14);
++    //        write_xenstore("R15", R15);
++    //        write_xenstore("RSP", RSP);
++    //        write_xenstore("RIP", RIP);
++
++    //    }
++    //    
++    //    libxl_domain_unpause(ctx, domid);
++    //}
+ 
+-    if (!paused)
++
++    if(!paused)
+         libxl_domain_unpause(ctx, domid);
+ 
+     ret = domid; /* caller gets success in parent */
+@@ -3816,6 +4557,13 @@
+     return 0;
+ }
+ 
++void fork_dom(struct domain_create dom_info);
++void fork_dom(struct domain_create dom_info) {
++    dom_info.config_file = "domain_config";
++    create_domain(&dom_info);
++}
++
++
+ int main_create(int argc, char **argv)
+ {
+     const char *filename = NULL;
+@@ -3836,7 +4584,9 @@
+         {0, 0, 0, 0}
+     };
+ 
+-    if (argv[1] && argv[1][0] != '-' && !strchr(argv[1], '=')) {
++	printf("go into the cmdimpl_main_create\n");
++    
++	if (argv[1] && argv[1][0] != '-' && !strchr(argv[1], '=')) {
+         filename = argv[1];
+         argc--; argv++;
+     }
+@@ -3913,7 +4663,17 @@
+     dom_info.vnc = vnc;
+     dom_info.vncautopass = vncautopass;
+     dom_info.console_autoconnect = console_autoconnect;
+-
++   
++	/*
++    pid_t child;
++    if ((child = fork()) == 0) {
++        sleep(20);
++        fork_dom(dom_info);
++        while (1) {
++            sleep(3);
++            printf("world\n");
++        }
++    } else {*/ 
+     rc = create_domain(&dom_info);
+     if (rc < 0)
+         return -rc;
+@@ -3921,6 +4681,49 @@
+     return 0;
+ }
+ 
++int main_update(int argc, char **argv)
++{
++	const char *filename = NULL;
++	int opt, rc;
++	int domainID;
++	int option_index = 0;
++
++	static struct option long_options[] = {
++		{"help", 0, 0, 'h'},
++		{0, 0, 0, 0}
++	};
++
++	if (argc < 3){
++		fprintf(stderr, "xl update requires a domain or filename\n");
++		help("update");
++		exit(1);
++	}
++
++	while (1) {
++		opt = getopt_long(argc, argv, "h", long_options, &option_index);
++		if (opt == -1)
++			break;
++
++		switch (opt) {
++			case 'h':
++				help("create");
++				return 0;
++			default:
++				fprintf(stderr, "option %c not supported.\n", optopt);
++				break;
++		}
++	}
++	domainID = atoi(argv[1]);
++	filename = argv[2];
++	//printf("domid = %d\n", domainID);
++	//printf("filename = %s\n", filename);
++	
++	rc = update_shared_library(filename, domainID);
++	if (rc < 0)
++		return -rc;
++	return 0;
++}
++
+ int main_config_update(int argc, char **argv)
+ {
+     const char *filename = NULL;
+diff -ruN xen-4.2.1-origin/tools/libxl/xl_cmdtable.c xen-4.2.1-merge/tools/libxl/xl_cmdtable.c
+--- xen-4.2.1-origin/tools/libxl/xl_cmdtable.c	2012-12-17 23:01:10.000000000 +0800
++++ xen-4.2.1-merge/tools/libxl/xl_cmdtable.c	2016-12-04 21:13:01.000000000 +0800
+@@ -13,7 +13,6 @@
+  */
+ 
+ #include <string.h>
+-
+ #include "libxl.h"
+ #include "xl.h"
+ 
+@@ -35,6 +34,12 @@
+       "-A, --vncviewer-autopass\n"
+       "                        Pass VNC password to viewer via stdin."
+     },
++	{ "update",
++	  &main_update, 1, 1,
++	  "Update a dynamic library for Domain",
++	  "<Domain> <Shared_library> [options] [vars]",
++	  "-h	Print this help.\n"
++	},
+     { "config-update",
+       &main_config_update, 1, 1,
+       "Update a running domain's saved configuration, used when rebuilding "
+diff -ruN xen-4.2.1-origin/tools/libxl/xl.h xen-4.2.1-merge/tools/libxl/xl.h
+--- xen-4.2.1-origin/tools/libxl/xl.h	2012-12-17 23:01:10.000000000 +0800
++++ xen-4.2.1-merge/tools/libxl/xl.h	2016-12-04 21:10:39.000000000 +0800
+@@ -56,6 +56,7 @@
+ int main_list(int argc, char **argv);
+ int main_vm_list(int argc, char **argv);
+ int main_create(int argc, char **argv);
++int main_update(int argc, char **argv);//xl update <domainID> <dynamic library>
+ int main_config_update(int argc, char **argv);
+ int main_button_press(int argc, char **argv);
+ int main_vcpupin(int argc, char **argv);
+@@ -102,6 +103,20 @@
+ int main_loadpolicy(int argc, char **argv);
+ int main_remus(int argc, char **argv);
+ 
++/*update shared library!*/
++int update_shared_library(const char *filename, int domainID);
++//void update_load_elf(struct elf_binary *elf, int domainID);
++int update_flag_iswrite(char *key, int domainID);
++int update_write_flag(char *key, char *value, int domainID);
++void update_write_data(int label, char *value, int domainID);
++int update_elf_load_image(void *dst, const void *src, uint64_t filesz, uint64_t memsz);
++struct elf_binary *update_parse_elf(void *image, size_t size);
++void *update_malloc_filemap(const char *filename, size_t *size);
++/*share a page*/
++char *update_read_domgfn(int domid);
++unsigned long update_get_gfn_domU(int domid);
++void *update_shared_page(int domid);
++
+ void help(const char *command);
+ 
+ extern struct cmd_spec cmd_table[];
